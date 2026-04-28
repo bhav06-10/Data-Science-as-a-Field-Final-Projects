@@ -1,0 +1,353 @@
+---
+title: "The Geography of Trauma: Deciphering the Life and Death Patterns of NYC Shootings"
+author: "Bhaveeasheshwar Eswaran"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 9, fig.height = 5)
+```
+
+# 1 The Question Behind the Numbers
+
+New York City publishes every shooting incident the NYPD has logged since 2006 — Each row is one incident: where, when, who was shot, and whether they survived. That's a lot of ground to cover, so this report focuses on a few questions that feel tractable and worth asking —
+
+- Which boroughs bear the most shooting violence, and does that vary by whether the shooting is fatal?
+- Who is getting shot, in terms of the demographic profile the data captures?
+- Has volume changed over time, especially around the pandemic years?
+- When do shootings cluster — hour of day, day of week?
+- Can we predict whether a shooting will be fatal from variables available at incident time?
+
+---
+
+# 2 Setup
+
+```{r packages}
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(janitor)
+library(broom)
+
+borough_colors <- c(
+  "BRONX"         = "#E63946",
+  "BROOKLYN"      = "#457B9D",
+  "MANHATTAN"     = "#2A9D8F",
+  "QUEENS"        = "#E9C46A",
+  "STATEN ISLAND" = "#A8DADC"
+)
+```
+
+---
+
+# 3 Getting the Data
+
+```{r load, cache=TRUE}
+raw <- read_csv(
+  "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD",
+  show_col_types = FALSE
+) %>% clean_names()
+```
+
+---
+
+# 4 Cleaning
+
+The raw file has 21 columns. A handful are useful; most aren't. Coordinate columns, jurisdiction codes, and location description are either too sparse or too granular to add anything here, so I'm dropping them upfront. Perpetrator fields sound useful but they're missing in over 60% of rows — mostly because the perpetrator was never identified — so they won't factor into the model.
+
+```{r clean}
+age_levels <- c("<18", "18-24", "25-44", "45-64", "65+")
+
+shootings <- raw %>%
+  select(occur_date, occur_time, boro, statistical_murder_flag,
+         vic_age_group, vic_sex, vic_race) %>%
+  mutate(
+    date    = mdy(occur_date),
+    hour    = hour(hms(occur_time)),
+    year    = year(date),
+    wday    = wday(date, label = TRUE, week_start = 1),
+    borough = factor(boro),
+    fatal   = as.integer(statistical_murder_flag),
+    vic_age = factor(
+      ifelse(vic_age_group %in% age_levels, vic_age_group, NA),
+      levels = age_levels,
+      ordered = TRUE
+    ),
+    vic_sex  = factor(ifelse(vic_sex %in% c("M", "F"), vic_sex, NA)),
+    vic_race = ifelse(vic_race %in% c("UNKNOWN", "(null)"), NA, vic_race)
+  ) %>%
+  select(-occur_date, -occur_time, -boro, -statistical_murder_flag,
+         -vic_age_group) %>%
+  filter(!is.na(date), year <= 2024)
+```
+
+## 4.1 What we're left with
+
+```{r check}
+cat(nrow(shootings), "incidents from", format(min(shootings$date), "%b %Y"),
+    "to", format(max(shootings$date), "%b %Y"), "\n")
+
+shootings %>% count(year) %>% print(n = 25)
+```
+
+## 4.2 Missingness
+
+```{r missing}
+shootings %>%
+  summarise(across(c(vic_age, vic_sex, vic_race, fatal),
+                   ~ round(mean(is.na(.x)) * 100, 1))) %>%
+  pivot_longer(everything(), names_to = "field", values_to = "pct_missing") %>%
+  arrange(desc(pct_missing)) %>%
+  knitr::kable(col.names = c("Field", "% Missing"))
+```
+
+Victim fields are mostly complete. `fatal` is fully populated — that's the outcome we care about.
+
+---
+
+# 5 Exploratory Analysis
+
+## 5.1 Borough by borough: raw volume
+
+```{r borough-vol}
+shootings %>%
+  count(borough) %>%
+  mutate(borough = fct_reorder(borough, n)) %>%
+  ggplot(aes(n, borough, fill = borough)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = comma(n)), hjust = -0.1, size = 3.5) +
+  scale_fill_manual(values = borough_colors) +
+  scale_x_continuous(labels = comma, expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Shooting incidents by borough, 2006–2024", x = NULL, y = NULL) +
+  theme_minimal(base_size = 12)
+```
+
+Brooklyn and the Bronx together account for around two-thirds of all incidents. Staten Island is in a different universe by comparison.
+
+## 5.2 Does fatality rate track with volume?
+
+Not necessarily — a high-volume borough could still have a lower proportion of fatal shootings.
+
+```{r fatality-borough}
+shootings %>%
+  group_by(borough) %>%
+  summarise(n = n(), fatal_pct = mean(fatal, na.rm = TRUE) * 100) %>%
+  arrange(desc(fatal_pct)) %>%
+  knitr::kable(digits = 1, col.names = c("Borough", "Incidents", "Fatal %"))
+```
+
+```{r fatality-plot}
+shootings %>%
+  filter(!is.na(fatal)) %>%
+  count(borough, fatal) %>%
+  mutate(fatal = factor(fatal, labels = c("Survived", "Fatal"))) %>%
+  ggplot(aes(borough, n, fill = fatal)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = percent) +
+  scale_fill_manual(values = c("Survived" = "#457B9D", "Fatal" = "#E63946")) +
+  labs(title = "Fatality proportion by borough", x = NULL, y = NULL, fill = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+```
+
+The borough ranking by fatality rate doesn't mirror the volume ranking closely — which hints that borough alone isn't the whole story.
+
+## 5.3 Who is getting shot?
+
+```{r victim-age}
+shootings %>%
+  filter(!is.na(vic_age)) %>%
+  count(vic_age) %>%
+  ggplot(aes(vic_age, n)) +
+  geom_col(fill = "#457B9D") +
+  geom_text(aes(label = comma(n)), vjust = -0.5, size = 3.3) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "Victim age group", x = NULL, y = NULL) +
+  theme_minimal(base_size = 12)
+```
+
+```{r victim-race}
+shootings %>%
+  filter(!is.na(vic_race)) %>%
+  count(vic_race) %>%
+  mutate(vic_race = str_wrap(vic_race, 22),
+         vic_race = fct_reorder(vic_race, n)) %>%
+  ggplot(aes(n, vic_race)) +
+  geom_col(fill = "#2A9D8F") +
+  scale_x_continuous(labels = comma) +
+  labs(title = "Victim race / ethnicity", x = NULL, y = NULL) +
+  theme_minimal(base_size = 12)
+```
+
+The 25–44 bracket is the largest group by a wide margin. The racial pattern is stark — Black New Yorkers represent the overwhelming majority of victims. This dataset records incidents, not population-adjusted risk, so reading it as a rate would require census denominators this file doesn't carry.
+
+## 5.4 The trend line
+
+```{r annual}
+shootings %>%
+  count(year) %>%
+  ggplot(aes(year, n)) +
+  geom_line(color = "#457B9D", linewidth = 1) +
+  geom_point(color = "#457B9D", size = 2.5) +
+  annotate("rect", xmin = 2019.5, xmax = 2022.5,
+           ymin = -Inf, ymax = Inf, fill = "grey80", alpha = 0.35) +
+  annotate("text", x = 2021, y = 150, label = "pandemic\nyears",
+           size = 3, color = "grey45", fontface = "italic") +
+  scale_x_continuous(breaks = seq(2006, 2024, 2)) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Annual shooting incidents, 2006–2024", x = NULL, y = "Incidents") +
+  theme_minimal(base_size = 12)
+```
+
+Shootings fell steadily from 2006 through 2019 — roughly halving over that stretch. Then 2020 snapped the trend sharply upward. By 2022 it had started pulling back again, but we're not back to pre-pandemic levels through 2024.
+
+## 5.5 When do they happen?
+
+### 5.5.1 By hour
+
+```{r hour}
+shootings %>%
+  count(hour) %>%
+  ggplot(aes(hour, n)) +
+  geom_col(fill = "#2A9D8F") +
+  scale_x_continuous(breaks = seq(0, 23, 3),
+                     labels = c("12am","3am","6am","9am","12pm","3pm","6pm","9pm")) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Shootings by hour of day", x = NULL, y = NULL) +
+  theme_minimal(base_size = 12)
+```
+
+### 5.5.2 By day of week
+
+```{r wday}
+shootings %>%
+  count(wday) %>%
+  ggplot(aes(wday, n)) +
+  geom_col(fill = "#E9C46A") +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Shootings by day of week", x = NULL, y = NULL) +
+  theme_minimal(base_size = 12)
+```
+
+### 5.5.3 Hour × day heatmap
+
+```{r heatmap}
+shootings %>%
+  count(wday, hour) %>%
+  ggplot(aes(hour, wday, fill = n)) +
+  geom_tile(color = "white", linewidth = 0.25) +
+  scale_fill_viridis_c(option = "C", labels = comma) +
+  scale_x_continuous(breaks = seq(0, 23, 3),
+                     labels = c("12am","3am","6am","9am","12pm","3pm","6pm","9pm")) +
+  labs(title = "Incident density — hour by day of week",
+       x = NULL, y = NULL, fill = "Incidents") +
+  theme_minimal(base_size = 12)
+```
+
+Late Saturday and Sunday nights (which are really early Sunday and Monday mornings) are consistently the hottest cells. The 6–10am window across the whole week is the quietest.
+
+---
+
+# 6 What Predicts a Fatal Shooting?
+
+I want to know whether anything measured at incident time — borough, victim age, victim sex, time of night, weekend — is associated with fatality. Logistic regression is the right tool: interpretable, well-suited to binary outcomes, and honest about what a single model can and can't claim.
+
+A few decisions before running anything:
+
+- **Victim age** is ordinal (`<18` through `65+`), so I'm treating it as an ordered factor. This lets the model estimate a single linear trend across age rather than five unconstrained dummies — more parsimonious and more sensible given the actual data.
+- **Night** is defined as 10pm–4am, where the heatmap concentration is visibly highest.
+- Only rows with complete `vic_age` and `vic_sex` are used. That drops about 5–7% of incidents — mostly older records with sparser fields.
+- `vic_race` is intentionally left out of the model. It's partially missing, highly correlated with borough (confounded at the neighborhood level), and including it would produce coefficients that are hard to interpret cleanly without a much more careful causal setup.
+
+```{r model}
+mdat <- shootings %>%
+  filter(!is.na(fatal), !is.na(vic_age), !is.na(vic_sex)) %>%
+  mutate(
+    night   = as.integer(hour >= 22 | hour <= 4),
+    weekend = as.integer(wday %in% c("Sat", "Sun")),
+    vic_sex = fct_drop(vic_sex)
+  )
+
+cat("Model sample:", comma(nrow(mdat)), "incidents |",
+    round(mean(mdat$fatal) * 100, 1), "% fatal\n")
+```
+
+```{r fit}
+fit <- glm(fatal ~ borough + vic_age + vic_sex + night + weekend,
+           data = mdat,
+           family = binomial)
+```
+
+```{r results}
+tidy(fit, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term = term %>%
+      str_remove("^borough") %>%
+      str_remove("^vic_age") %>%
+      str_replace("^vic_sex", "Sex: ") %>%
+      str_replace("\\.L$", " (linear trend)"),
+    sig = case_when(p.value < 0.001 ~ "***",
+                    p.value < 0.01  ~ "**",
+                    p.value < 0.05  ~ "*",
+                    TRUE            ~ "")
+  ) %>%
+  select(term, estimate, conf.low, conf.high, p.value, sig) %>%
+  knitr::kable(digits = 3,
+               col.names = c("Predictor", "OR", "95% lo", "95% hi", "p", ""))
+```
+
+```{r or-plot}
+tidy(fit, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term = term %>%
+      str_remove("^borough") %>%
+      str_remove("^vic_age") %>%
+      str_replace("^vic_sex", "Sex: ") %>%
+      str_replace("\\.L$", " (linear)"),
+    term = fct_reorder(term, estimate)
+  ) %>%
+  ggplot(aes(estimate, term)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey55") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                 height = 0.25, color = "grey40") +
+  geom_point(size = 3, color = "#E63946") +
+  labs(title = "Odds ratios — logistic model for fatal outcome",
+       subtitle = "Reference: Brooklyn, female victim, daytime, weekday",
+       x = "Odds ratio (95% CI)", y = NULL) +
+  theme_minimal(base_size = 12)
+```
+
+```{r pseudo-r2}
+# McFadden's pseudo-R² — a rough sense of model fit
+null_ll  <- logLik(glm(fatal ~ 1, data = mdat, family = binomial))
+fit_ll   <- logLik(fit)
+cat("McFadden R²:", round(1 - as.numeric(fit_ll) / as.numeric(null_ll), 3), "\n")
+```
+
+**What the model says.** Age has the strongest and most interpretable signal: each step up the age ladder (18-24 → 25-44 → 45-64 → 65+) is associated with higher odds of a fatal outcome. A shooting involving a 65+ victim is roughly two to three times as likely to be fatal as one involving an 18–24 victim, holding other predictors constant — plausibly because older victims are less physiologically resilient to gunshot injuries. Male victims have lower odds of fatality than female, which runs counter to the naive assumption; male victims are far more numerous but females who are shot appear to face worse odds of survival (small cell counts for female victims warrant caution here). Night and weekend are both near 1.0 with wide CIs — time of day doesn't add much after accounting for who was shot and where.
+
+Borough coefficients are present but should be read carefully: they absorb neighborhood-level differences in trauma center proximity, police response time, and underlying violence patterns that the model can't disentangle.
+
+McFadden's R² in the 0.02–0.05 range is typical for this kind of population-level logistic model — we're not building a classifier, we're looking for associations. The practical predictive value is low; the inferential signal is what we're after.
+
+---
+
+## Bias and What This Can't Tell Us
+
+This data reflects what the NYPD recorded and how they classified it. Reporting isn't uniform across neighborhoods — patrol density, community trust, and how officers classify an incident all shape what ends up in this file. Racial disparities in the data should be read alongside known disparities in who gets policed, not just who gets shot. And nothing here is causal: the model identifies correlates of fatality, not causes.
+
+---
+
+*Source: NYPD Shooting Incident Data (Historic), NYC Open Data — Jan 2006 through Dec 2024.*

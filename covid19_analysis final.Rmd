@@ -1,0 +1,396 @@
+---
+title: "Waves, Deaths, and the Geography of a Pandemic"
+author: "Bhaveeasheshwar Eswaran"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE, fig.width=9, fig.height=5)
+```
+
+## The Question Behind the Numbers
+
+By the time Johns Hopkins shut down its COVID-19 dashboard in March 2023, it had logged over a thousand days of daily case and death counts for every country on earth — and every county in the United States. The dataset is one of the most cited in pandemic research, but most summaries just flatten it into global totals and move on. That obscures almost everything interesting.
+
+This report focuses on a narrower set of questions. Did states that got hit harder also die at higher rates, or did that relationship fall apart? Why does Yemen's case fatality rate look worse than Italy's at peak, even though Italy's hospitals were shown overwhelmed on live television? And — the hardest one — can anything observable in a country's *first wave* predict how badly the death toll ultimately landed?
+
+```{r libs}
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(broom)
+library(gridExtra)
+```
+
+---
+
+## Getting the Data
+
+```{r load}
+base <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/"
+
+raw_us_cases  <- read_csv(paste0(base, "time_series_covid19_confirmed_US.csv"),     show_col_types=FALSE)
+raw_us_deaths <- read_csv(paste0(base, "time_series_covid19_deaths_US.csv"),        show_col_types=FALSE)
+raw_gl_cases  <- read_csv(paste0(base, "time_series_covid19_confirmed_global.csv"), show_col_types=FALSE)
+raw_gl_deaths <- read_csv(paste0(base, "time_series_covid19_deaths_global.csv"),    show_col_types=FALSE)
+```
+
+Four files from the JHU CSSE repository. The US files run at county level — roughly 3,200 rows each, one per county — with cases and deaths in separate files that need to be joined. The global files report by country. Both sets are in wide format: one column per date, which means around 1,100 columns by the end of the series. That goes long before anything useful can be computed.
+
+---
+
+## Cleaning
+
+The US files carry eleven columns of geographic metadata before the first date — FIPS codes, lat/lon, combined keys. Useful for mapping, not needed here. The global files have a `Province/State` column that's only populated where countries reported sub-nationally (Australia, Canada, China, a few others); collapsing to country level loses nothing for the analysis.
+
+```{r clean}
+date_cols <- function(df) names(df)[grepl("^\\d+/\\d+/\\d+$", names(df))]
+
+tidy_us <- function(df, val) {
+  df %>%
+    select(Province_State, all_of(date_cols(df))) %>%
+    pivot_longer(-Province_State, names_to="d", values_to=val) %>%
+    mutate(date=mdy(d), state=Province_State) %>%
+    select(state, date, all_of(val)) %>%
+    group_by(state, date) %>%
+    summarise(across(all_of(val), sum, na.rm=TRUE), .groups="drop")
+}
+
+us <- left_join(
+  tidy_us(raw_us_cases,  "cases"),
+  tidy_us(raw_us_deaths, "deaths"),
+  by=c("state","date")
+) %>%
+  filter(!state %in% c("Diamond Princess","Grand Princess","American Samoa",
+                       "Northern Mariana Islands","Virgin Islands","Guam"))
+
+tidy_global <- function(df, val) {
+  df %>%
+    rename(country=`Country/Region`) %>%
+    select(-`Province/State`, -Lat, -Long) %>%
+    pivot_longer(-country, names_to="d", values_to=val) %>%
+    mutate(date=mdy(d)) %>%
+    select(country, date, all_of(val)) %>%
+    group_by(country, date) %>%
+    summarise(across(all_of(val), sum, na.rm=TRUE), .groups="drop")
+}
+
+global <- left_join(
+  tidy_global(raw_gl_cases,  "cases"),
+  tidy_global(raw_gl_deaths, "deaths"),
+  by=c("country","date")
+)
+```
+
+The cruise ships get dropped — Diamond Princess and Grand Princess are in the raw file as "states" and are clearly not. The US territories (Guam, USVI, etc.) report so sparsely early on that they'd distort state-level comparisons.
+
+### What's left
+
+```{r dim-check}
+cat(n_distinct(us$state), "US states/territories |",
+    format(min(us$date), "%b %Y"), "–", format(max(us$date), "%b %Y"), "\n")
+
+cat(n_distinct(global$country), "countries |",
+    format(min(global$date), "%b %Y"), "–", format(max(global$date), "%b %Y"), "\n")
+```
+
+### Missingness
+
+```{r miss}
+bind_rows(
+  us     %>% summarise(across(c(cases,deaths), ~round(mean(is.na(.x))*100,1))) %>% mutate(src="US"),
+  global %>% summarise(across(c(cases,deaths), ~round(mean(is.na(.x))*100,1))) %>% mutate(src="Global")
+) %>%
+  pivot_longer(-src, names_to="field", values_to="pct_missing") %>%
+  knitr::kable(col.names=c("Source","Field","% Missing"))
+```
+
+The JHU series is nearly complete. The near-zero missingness is partly a product of how JHU handled non-reporting days — they carried forward the previous value, so apparent zeros in the raw data aren't missing, they're reported. This matters when computing daily new cases: the 7-day average used later smooths out the worst of the weekend reporting lumpiness, where counties would report nothing Friday–Sunday and then batch-report Monday.
+
+---
+
+## Exploratory Analysis
+
+### US State by State: Raw Volume
+
+California accumulated 12 million confirmed cases. Wyoming, 170,000. Some of that gap is just population — California has 40 million people, Wyoming has 600,000. The more interesting question is whether the states that got hit hardest in case volume also died at the highest rates, or whether those two things came apart depending on when they were hit and how well they tested.
+
+```{r state-bars, fig.height=7}
+us_totals <- us %>%
+  group_by(state) %>%
+  summarise(total_cases=max(cases), total_deaths=max(deaths)) %>%
+  mutate(cfr=total_deaths/total_cases*100) %>%
+  filter(total_cases > 0)
+
+us_totals %>%
+  slice_max(total_cases, n=20) %>%
+  mutate(state=fct_reorder(state, total_cases)) %>%
+  ggplot(aes(total_cases, state)) +
+  geom_col(fill="#457B9D") +
+  geom_text(aes(label=comma(total_cases)), hjust=-0.1, size=3) +
+  scale_x_continuous(labels=label_number(scale=1e-6, suffix="M"),
+                     expand=expansion(mult=c(0,0.15))) +
+  labs(title="Confirmed COVID-19 cases by state, 2020–2023", x=NULL, y=NULL) +
+  theme_minimal(base_size=12)
+```
+
+California, Texas, Florida — together they account for roughly a quarter of all US cases. Population does most of that work.
+
+### Does Dying Track with Getting Sick?
+
+```{r cfr-scatter}
+us_totals %>%
+  filter(total_cases > 400000) %>%
+  ggplot(aes(total_cases, total_deaths, label=state)) +
+  geom_point(aes(color=cfr), size=3.5) +
+  geom_text(vjust=-0.8, size=2.7, check_overlap=TRUE) +
+  scale_x_continuous(labels=label_number(scale=1e-6, suffix="M")) +
+  scale_y_continuous(labels=comma) +
+  scale_color_gradient(low="#A8DADC", high="#E63946", name="CFR (%)") +
+  labs(title="More cases doesn't mean proportionally more deaths",
+       subtitle="States with 400k+ confirmed cases", x="Total cases", y="Total deaths") +
+  theme_minimal(base_size=12)
+```
+
+```{r cfr-table}
+us_totals %>%
+  arrange(desc(cfr)) %>%
+  slice_head(n=12) %>%
+  knitr::kable(digits=2, col.names=c("State","Cases","Deaths","CFR (%)"))
+```
+
+Pennsylvania and New Jersey sit near the top of the CFR table not because they had the most cases — they didn't — but because their spring 2020 outbreaks ripped through nursing homes before any testing infrastructure existed. At that point, you only confirmed a case if someone was sick enough to be hospitalized, which means the denominator was artificially small and the death rate looks catastrophically high. Mississippi and Alabama follow for different reasons: older populations, higher rates of comorbidities, thinner hospital capacity per capita. Florida's CFR looks almost moderate relative to case volume, which reflects aggressive case detection in a younger-skewing tourist population.
+
+The metric you use tells different stories depending on when you start counting and who you test.
+
+### The Wave Structure — US National
+
+```{r national-wave}
+us_national <- us %>%
+  group_by(date) %>%
+  summarise(cases=sum(cases), deaths=sum(deaths)) %>%
+  arrange(date) %>%
+  mutate(
+    new_cases  = pmax(cases  - lag(cases,  7, default=0), 0) / 7,
+    new_deaths = pmax(deaths - lag(deaths, 7, default=0), 0) / 7
+  )
+
+us_national %>%
+  filter(date >= "2020-03-01") %>%
+  ggplot(aes(date, new_cases)) +
+  geom_area(fill="#457B9D", alpha=0.55) +
+  geom_line(color="#457B9D", linewidth=0.7) +
+  scale_y_continuous(labels=comma) +
+  scale_x_date(date_breaks="3 months", date_labels="%b %Y") +
+  labs(title="US: 7-day average daily new cases",
+       caption="Peaks: summer 2020 → winter 2020–21 → Delta fall '21 → Omicron Jan '22",
+       x=NULL, y=NULL) +
+  theme_minimal(base_size=12) +
+  theme(axis.text.x=element_text(angle=30, hjust=1))
+```
+
+Omicron's spike in January 2022 is so tall it visually flattens everything before it. At peak, the US was recording around 800,000 confirmed cases per day — more than the entire first three months of 2020 combined, in a single day. Every prior wave that felt catastrophic at the time barely registers on this scale.
+
+```{r death-wave}
+us_national %>%
+  filter(date >= "2020-03-01") %>%
+  ggplot(aes(date, new_deaths)) +
+  geom_area(fill="#E63946", alpha=0.45) +
+  geom_line(color="#E63946", linewidth=0.7) +
+  scale_y_continuous(labels=comma) +
+  scale_x_date(date_breaks="3 months", date_labels="%b %Y") +
+  labs(title="US: 7-day average daily new deaths", x=NULL, y=NULL) +
+  theme_minimal(base_size=12) +
+  theme(axis.text.x=element_text(angle=30, hjust=1))
+```
+
+The death curve tells the more honest story. Omicron's death wave is real — but nowhere near proportional to the case spike. Vaccination had partially severed that link by early 2022. The actual worst period by daily death count was January 2021, pre-vaccine, when the US was losing roughly 3,000–4,000 people a day. That's approximately the death toll of September 11th, every day, for about six weeks.
+
+### The Global Picture
+
+```{r global-cases}
+global_totals <- global %>%
+  group_by(country) %>%
+  summarise(total_cases=max(cases, na.rm=TRUE), total_deaths=max(deaths, na.rm=TRUE)) %>%
+  mutate(cfr=ifelse(total_cases > 0, total_deaths/total_cases*100, NA))
+
+global_totals %>%
+  slice_max(total_cases, n=15) %>%
+  mutate(country=fct_reorder(country, total_cases)) %>%
+  ggplot(aes(total_cases, country)) +
+  geom_col(fill="#2A9D8F") +
+  geom_text(aes(label=comma(total_cases)), hjust=-0.1, size=3) +
+  scale_x_continuous(labels=label_number(scale=1e-6, suffix="M"),
+                     expand=expansion(mult=c(0,0.15))) +
+  labs(title="Total confirmed cases — top 15 countries", x=NULL, y=NULL) +
+  theme_minimal(base_size=12)
+```
+
+```{r global-deaths}
+global_totals %>%
+  slice_max(total_deaths, n=15) %>%
+  mutate(country=fct_reorder(country, total_deaths)) %>%
+  ggplot(aes(total_deaths, country)) +
+  geom_col(fill="#E63946") +
+  geom_text(aes(label=comma(total_deaths)), hjust=-0.1, size=3) +
+  scale_x_continuous(labels=comma, expand=expansion(mult=c(0,0.15))) +
+  labs(title="Total confirmed deaths — top 15 countries", x=NULL, y=NULL) +
+  theme_minimal(base_size=12)
+```
+
+The US leads both lists. That's partly genuine — American outcomes were worse than peer nations on a per-capita basis by most measures — and partly a testing artifact. The US tested more aggressively than most countries, so more mild infections ended up in the denominator.
+
+### CFR: The Metric That Lies and Tells the Truth Simultaneously
+
+```{r cfr-global}
+global_totals %>%
+  filter(total_cases > 100000) %>%
+  slice_max(cfr, n=15) %>%
+  mutate(country=fct_reorder(country, cfr)) %>%
+  ggplot(aes(cfr, country)) +
+  geom_col(fill="#E9C46A") +
+  geom_text(aes(label=paste0(round(cfr,1),"%")), hjust=-0.1, size=3) +
+  scale_x_continuous(expand=expansion(mult=c(0,0.2))) +
+  labs(title="Highest case fatality rates — countries with 100k+ confirmed cases",
+       x="CFR (%)", y=NULL) +
+  theme_minimal(base_size=12)
+```
+
+Yemen's CFR sits above 18%. That's not because the virus behaved differently there — it's because Yemen only confirmed cases severe enough to reach a health system already being dismantled by civil war. When you test almost nobody, your confirmed case count is almost entirely people who are actively dying. The denominator collapses, the rate inflates. 
+
+### Global Wave Timeline
+
+```{r global-wave}
+global %>%
+  group_by(date) %>%
+  summarise(cases=sum(cases, na.rm=TRUE)) %>%
+  arrange(date) %>%
+  mutate(new_cases=pmax(cases - lag(cases, 7, default=0), 0) / 7) %>%
+  filter(date >= "2020-03-01") %>%
+  ggplot(aes(date, new_cases)) +
+  geom_area(fill="#457B9D", alpha=0.5) +
+  geom_line(color="#457B9D", linewidth=0.7) +
+  scale_y_continuous(labels=comma) +
+  scale_x_date(date_breaks="3 months", date_labels="%b %Y") +
+  labs(title="Global: 7-day average new cases", x=NULL, y=NULL) +
+  theme_minimal(base_size=12) +
+  theme(axis.text.x=element_text(angle=30, hjust=1))
+```
+
+Omicron arrived nearly simultaneously across Europe, North America, and parts of Asia in late 2021 and early 2022. On a global scale, everything before it reads as noise. This is what exponential growth looks like when a variant combines strong immune escape with high transmissibility: it doesn't just add to what came before, it makes what came before look like it barely happened.
+
+---
+
+## What Predicts Ending Up Among the Worst-Hit Countries?
+
+The modeling question here is deliberately practical: among countries that had substantial outbreaks, what was visible in the first two months of a country's case trajectory that predicted ending up in the upper half of death burden by the end of the pandemic?
+
+**Why logistic regression, and why the binary outcome.** CFR is continuous, so dichotomizing it at the median throws away information — that's a real cost. The justification is that the binary framing maps onto a real question: were there early observable signals that a country was heading toward a bad outcome? "Above or below median CFR" is a cruder version of "did the first wave overwhelm the system before any response took hold." It's not the only valid framing, but it's an honest one for the data available.
+
+The two predictors come entirely from what was observable early in each country's outbreak:
+
+- **Log total cases** — a proxy for testing intensity. Countries that tested broadly accumulated more confirmed cases, which should push CFR *down* (more mild infections in the denominator). A negative coefficient here would indicate that the testing-denominator effect dominated.
+- **Early growth rate** — cases at day 60 divided by cases at day 30 of each country's outbreak. A ratio above 2 means cases more than doubled in that 30-day window. Fast early growth plausibly tracks with healthcare system strain arriving before any mitigation could respond.
+
+Countries with fewer than 50,000 total confirmed cases are excluded — their CFRs are too volatile to mean much (a single super-spreader event can swing the apparent rate dramatically at small denominators). Reported CFRs above 30% are also excluded; those are data artifacts from countries that barely confirmed any cases at all.
+
+```{r model-data}
+outbreak_start <- global %>%
+  filter(cases > 0) %>%
+  group_by(country) %>%
+  summarise(start=min(date))
+
+growth <- global %>%
+  left_join(outbreak_start, by="country") %>%
+  mutate(day=as.integer(date - start)) %>%
+  filter(day %in% c(30, 60)) %>%
+  group_by(country, day) %>%
+  summarise(cases=mean(cases), .groups="drop") %>%
+  pivot_wider(names_from=day, values_from=cases, names_prefix="d") %>%
+  mutate(growth_ratio=ifelse(!is.na(d30) & d30 > 0, d60/d30, NA)) %>%
+  select(country, growth_ratio)
+
+mdat <- global_totals %>%
+  left_join(growth, by="country") %>%
+  filter(total_cases >= 50000, !is.na(cfr), !is.na(growth_ratio), cfr > 0, cfr < 30) %>%
+  mutate(
+    high_cfr   = as.integer(cfr > median(cfr)),
+    log_cases  = log10(total_cases),
+    log_growth = log10(pmax(growth_ratio, 0.01))
+  )
+
+cat(nrow(mdat), "countries in model |", sum(mdat$high_cfr), "above median CFR |",
+    round(mean(mdat$high_cfr)*100, 1), "% positive rate\n")
+```
+
+```{r fit}
+fit <- glm(high_cfr ~ log_cases + log_growth, data=mdat, family=binomial)
+
+tidy(fit, exponentiate=TRUE, conf.int=TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term = c("Log10(total cases)", "Log10(growth ratio, day 30→60)"),
+    sig  = case_when(p.value < 0.001~"***", p.value < 0.01~"**", p.value < 0.05~"*", TRUE~"")
+  ) %>%
+  select(term, estimate, conf.low, conf.high, p.value, sig) %>%
+  knitr::kable(digits=3, col.names=c("Predictor","OR","95% lo","95% hi","p",""))
+```
+
+The odds ratio on log total cases is below 1: countries with more confirmed cases were *less* likely to land in the high-CFR group. That's the testing signal — high case counts reflect broad testing, which captures mild infections and suppresses the apparent death rate. The growth ratio points the other direction: faster first waves associate with worse eventual death outcomes, consistent with healthcare overwhelm arriving before any response could take hold.
+
+Rather than stopping at a coefficient table, the more useful output is what the model actually computes — predicted probability of landing above median CFR as a function of each predictor, with the other held at its median value in the sample.
+
+```{r pred-curves, fig.height=4}
+med_lg <- median(mdat$log_growth)
+med_lc <- median(mdat$log_cases)
+
+p1 <- tibble(log_cases=seq(min(mdat$log_cases), max(mdat$log_cases), length=120),
+             log_growth=med_lg) %>%
+  mutate(pred=predict(fit, newdata=., type="response")) %>%
+  ggplot(aes(log_cases, pred)) +
+  geom_line(color="#E63946", linewidth=1.2) +
+  geom_rug(data=mdat, aes(x=log_cases, y=NULL), alpha=0.35, sides="b") +
+  scale_y_continuous(labels=percent, limits=c(0,1)) +
+  labs(title="More testing → lower predicted CFR",
+       x="Log10(total cases)", y="P(above-median CFR)") +
+  theme_minimal(base_size=11)
+
+p2 <- tibble(log_growth=seq(min(mdat$log_growth), max(mdat$log_growth), length=120),
+             log_cases=med_lc) %>%
+  mutate(pred=predict(fit, newdata=., type="response")) %>%
+  ggplot(aes(log_growth, pred)) +
+  geom_line(color="#457B9D", linewidth=1.2) +
+  geom_rug(data=mdat, aes(x=log_growth, y=NULL), alpha=0.35, sides="b") +
+  scale_y_continuous(labels=percent, limits=c(0,1)) +
+  labs(title="Faster early spread → higher predicted CFR",
+       x="Log10(growth ratio, day 30→60)", y="P(above-median CFR)") +
+  theme_minimal(base_size=11)
+
+grid.arrange(p1, p2, ncol=2)
+```
+
+```{r mcfadden}
+null_ll <- logLik(glm(high_cfr ~ 1, data=mdat, family=binomial))
+cat("McFadden R²:", round(1 - as.numeric(logLik(fit)) / as.numeric(null_ll), 3), "\n")
+```
+
+McFadden's R² is reported here not to claim strong fit — a value in the 0.05–0.10 range on country-level aggregates is expected and modest. It's reported to be explicit: two variables extracted purely from case count trajectories explain *some* of where countries ended up, but nowhere near all of it. The missing pieces are things this dataset doesn't carry — ICU beds per capita, median age, obesity prevalence, vaccine timing, what policies were in place on day 30. The direction of the associations is meaningful; the predictive precision is not.
+
+---
+
+## Bias and What This Can't Tell Us
+
+Every number in this dataset is filtered through a government's willingness and capacity to count. The JHU series reflects *reported* cases and *reported* deaths — both of which diverged from reality by factors that varied enormously by country and time. The Economist estimated global excess deaths at somewhere between 10 and 18 million by end of 2021; the JHU confirmed death count at that point was around 5 million. The gap is the part of the iceberg below the water.
+
+For the US, county-level data has a specific early-2020 distortion: states that barely tested look artificially clean through March and April 2020. Not because they weren't being hit — they were — but because they weren't finding it. New York's early case counts look catastrophically high partly because New York was the first state to actually test at scale. That pattern shapes everything in the pre-vaccine period.
+
+The model identifies correlates, not causes. A country's growth rate in the first 30–60 days reflects dozens of structural and policy decisions simultaneously — population density, testing capacity, lockdown timing, border controls — none of which can be separated from case trajectory alone. And the CFR dichotomization is a deliberate simplification: a country at the 51st percentile and one at the 99th are treated identically as "high." That's the cost of fitting the data to a binary logistic frame. The associations are real; the precision is limited.
+
+**Source:** COVID-19 Data Repository by the Center for Systems Science and Engineering (CSSE) at Johns Hopkins University. [github.com/CSSEGISandData/COVID-19](https://github.com/CSSEGISandData/COVID-19). Series covers January 2020 through March 2023.

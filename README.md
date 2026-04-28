@@ -14,7 +14,7 @@ The data maps the pattern. It doesn't explain it. It shows us where and when and
 | | |
 |---|---|
 | **Video presentation** | [Watch on Google Drive][(https://drive.google.com/file/d/1sPjRuUHtrHdEsgo8kMVAnsFCDbWU224S/view?usp=sharing)] |
-| **Analysis report** | [NYPD_Analysis.Rmd](./NYPD_Shooting_Analysis_LRclass....Rmd) |
+| **Analysis report** | [NYPD_Analysis.Rmd]([./NYPD_Shooting_Analysis_LRclass....Rmd](https://github.com/bhav06-10/Data-Science-as-a-Field-Final-Projects/blob/5494dcc9b5ef1ed44fe8df01354837bf6ffa5069/NYPD_Shooting_Analysis_LRclass.Rmd)) |
 
 ---
 
